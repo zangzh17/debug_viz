@@ -1,6 +1,11 @@
-"""Public API: view / compare / save."""
+"""Public API: view / compare / save.
+
+Sends the raw numpy array (.npy bytes) + parameters to the server, which does
+all rendering + DZI pyramid generation. This keeps the debugger-paused process
+unblocked sooner (transfer over localhost is ~1-2 GB/s)."""
 from __future__ import annotations
 
+import io
 import json
 import math
 import os
@@ -10,33 +15,71 @@ from pathlib import Path
 from typing import Any, Literal
 
 import httpx
+import numpy as np
 
 from .boot import base_url, ensure_server
-from .encode import encode_array
 
-_POST_TIMEOUT = 30.0
+_POST_TIMEOUT = 60.0
 _FALLBACK_DIR = Path("/tmp/debug_viz")
 
 
 def _sanitize_for_json(obj: Any) -> Any:
     if isinstance(obj, dict):
         return {k: _sanitize_for_json(v) for k, v in obj.items()}
-    if isinstance(obj, list):
-        return [_sanitize_for_json(v) for v in obj]
-    if isinstance(obj, tuple):
+    if isinstance(obj, (list, tuple)):
         return [_sanitize_for_json(v) for v in obj]
     if isinstance(obj, float) and (math.isnan(obj) or math.isinf(obj)):
         return None
+    if isinstance(obj, np.generic):
+        return obj.item()
     return obj
 
 
-def _fallback_write(data: bytes, label: str | None, ext: str = "webp") -> Path:
+def _npy_bytes(arr: np.ndarray) -> bytes:
+    buf = io.BytesIO()
+    np.save(buf, arr, allow_pickle=False)
+    return buf.getvalue()
+
+
+def _fallback_save(arr: np.ndarray, label: str | None) -> Path:
+    """Server unreachable — best-effort render to a PNG on disk."""
+    from .encode import render_array
     _FALLBACK_DIR.mkdir(parents=True, exist_ok=True)
     ts = time.strftime("%Y%m%d-%H%M%S")
-    name = f"{ts}_{(label or 'frame').replace('/', '_')}.{ext}"
+    name = f"{ts}_{(label or 'frame').replace('/', '_')}.png"
     p = _FALLBACK_DIR / name
-    p.write_bytes(data)
+    try:
+        result = render_array(arr)
+        result["image"].save(p, format="PNG")
+    except Exception:
+        # last-resort: dump raw shape info
+        p.write_text(f"unsupported: shape={getattr(arr, 'shape', None)}")
     return p
+
+
+def _panel_payload(
+    arr: np.ndarray,
+    *,
+    label: str | None,
+    kind: str,
+    scale: str,
+    clip_pct: tuple[float, float],
+    log_dr: float | None,
+    bands: tuple[int, ...] | None,
+    wavelength: float | None,
+    wavelengths: list[float] | tuple[float, ...] | None,
+) -> dict[str, Any]:
+    return {
+        "id": uuid.uuid4().hex,
+        "label": label or "",
+        "kind": kind,
+        "scale": scale,
+        "clip_pct": list(clip_pct),
+        "log_dr": log_dr,
+        "bands": list(bands) if bands else None,
+        "wavelength": wavelength,
+        "wavelengths": list(wavelengths) if wavelengths else None,
+    }
 
 
 def view(
@@ -45,111 +88,109 @@ def view(
     label: str | None = None,
     kind: Literal["auto", "gray", "mono", "rgb", "raw", "multi"] = "auto",
     bands: tuple[int, ...] | None = None,
+    wavelength: float | None = None,
+    wavelengths: list[float] | tuple[float, ...] | None = None,
     scale: Literal["linear", "log"] = "linear",
     clip_pct: tuple[float, float] = (1.0, 99.0),
+    log_dr: float | None = None,
 ) -> None:
     try:
-        enc = encode_array(x, kind=kind, bands=bands, scale=scale, clip_pct=clip_pct)
+        arr = np.asarray(x)
     except Exception as e:
-        print(f"[debug_viz] encode failed: {e}")
+        print(f"[debug_viz] cannot convert to array: {e}")
         return
 
-    band_meta = None
-    if enc.get("bands"):
-        band_meta = [{"label": b["label"], "stats": b["stats"], "clip": b["clip"]}
-                     for b in enc["bands"]]
-
-    meta = {
+    panel = _panel_payload(
+        arr, label=label, kind=kind, scale=scale, clip_pct=clip_pct,
+        log_dr=log_dr, bands=bands, wavelength=wavelength, wavelengths=wavelengths,
+    )
+    meta = _sanitize_for_json({
         "id": uuid.uuid4().hex,
         "label": label or "",
         "ts": time.time(),
         "mode": "single",
-        "kind": enc["kind"],
-        "fmt": enc["fmt"],
-        "shape": enc["shape"],
-        "dtype": enc["dtype"],
-        "stats": enc["stats"],
-        "scale": enc["scale"],
-        "clip": enc["clip"],
-        "note": enc["note"],
-        "bands_selected": list(bands) if bands else None,
-        "n_bands": len(enc["bands"]) if enc.get("bands") else 0,
-        "band_meta": band_meta,
-    }
-    meta = _sanitize_for_json(meta)
+        "panels": [panel],
+    })
 
     if not ensure_server(timeout_sec=5.0):
-        p = _fallback_write(enc["main_full"], label, ext=enc["fmt"])
+        p = _fallback_save(arr, label)
         print(f"[debug_viz] server unavailable; saved {p}")
         return
 
     try:
         files = {
             "metadata": (None, json.dumps(meta), "application/json"),
-            "main_full": (f"main.{enc['fmt']}", enc["main_full"], f"image/{enc['fmt']}"),
-            "main_thumb": (f"main_t.{enc['fmt']}", enc["main_thumb"], f"image/{enc['fmt']}"),
+            f"raw_{panel['id']}": (f"{panel['id']}.npy", _npy_bytes(arr),
+                                   "application/octet-stream"),
         }
-        for i, b in enumerate(enc.get("bands") or []):
-            files[f"band_{i}_full"] = (f"b{i}.{enc['fmt']}", b["full"], f"image/{enc['fmt']}")
-            files[f"band_{i}_thumb"] = (f"b{i}_t.{enc['fmt']}", b["thumb"], f"image/{enc['fmt']}")
         httpx.post(f"{base_url()}/event", files=files, timeout=_POST_TIMEOUT)
     except Exception as e:
-        p = _fallback_write(enc["main_full"], label, ext=enc["fmt"])
+        p = _fallback_save(arr, label)
         print(f"[debug_viz] post failed ({e}); saved {p}")
 
 
 def compare(
-    a: Any,
-    b: Any,
-    *,
+    *arrays: Any,
     label: str | None = None,
-    kind: Literal["auto", "gray", "mono", "rgb", "raw"] = "auto",
+    labels: list[str] | tuple[str, ...] | None = None,
+    kind: Literal["auto", "gray", "mono", "rgb", "raw", "multi"] = "auto",
+    bands: tuple[int, ...] | None = None,
+    wavelength: float | None = None,
+    wavelengths: list[float] | tuple[float, ...] | None = None,
     scale: Literal["linear", "log"] = "linear",
     clip_pct: tuple[float, float] = (1.0, 99.0),
+    log_dr: float | None = None,
 ) -> None:
-    try:
-        enc_a = encode_array(a, kind=kind, scale=scale, clip_pct=clip_pct)
-        enc_b = encode_array(b, kind=kind, scale=scale, clip_pct=clip_pct)
-    except Exception as e:
-        print(f"[debug_viz] encode failed: {e}")
+    """Compare 2-3 arrays side by side. Each gets its own panel + sub-title.
+
+    compare(a, b)                        # 2-way
+    compare(a, b, c, labels=("input", "denoised", "gt"))   # 3-way
+    compare(a, b, label="before / after")                  # backward-compat
+    """
+    if len(arrays) < 2:
+        print("[debug_viz] compare requires at least 2 arrays")
+        return
+    if len(arrays) > 4:
+        print(f"[debug_viz] compare supports up to 4 arrays (got {len(arrays)})")
         return
 
-    fmt = enc_a["fmt"]
-    meta = {
+    try:
+        nps = [np.asarray(x) for x in arrays]
+    except Exception as e:
+        print(f"[debug_viz] cannot convert to arrays: {e}")
+        return
+
+    sublabels = list(labels) if labels else [f"{chr(ord('A') + i)}" for i in range(len(nps))]
+    panels = [
+        _panel_payload(
+            a, label=sublabels[i] if i < len(sublabels) else f"{i}",
+            kind=kind, scale=scale, clip_pct=clip_pct, log_dr=log_dr,
+            bands=bands, wavelength=wavelength, wavelengths=wavelengths,
+        )
+        for i, a in enumerate(nps)
+    ]
+    meta = _sanitize_for_json({
         "id": uuid.uuid4().hex,
         "label": label or "",
         "ts": time.time(),
         "mode": "compare",
-        "kind": enc_a["kind"],
-        "fmt": fmt,
-        "shape": [enc_a["shape"], enc_b["shape"]],
-        "dtype": [enc_a["dtype"], enc_b["dtype"]],
-        "stats": [enc_a["stats"], enc_b["stats"]],
-        "scale": scale,
-        "clip": [enc_a["clip"], enc_b["clip"]],
-        "note": enc_a["note"] or enc_b["note"],
-    }
-    meta = _sanitize_for_json(meta)
+        "panels": panels,
+    })
 
     if not ensure_server(timeout_sec=5.0):
-        pa = _fallback_write(enc_a["main_full"], (label or "") + "_a", ext=fmt)
-        pb = _fallback_write(enc_b["main_full"], (label or "") + "_b", ext=fmt)
-        print(f"[debug_viz] server unavailable; saved {pa}, {pb}")
+        for a, p in zip(nps, panels):
+            fp = _fallback_save(a, f"{label or 'cmp'}_{p['label']}")
+            print(f"[debug_viz] server unavailable; saved {fp}")
         return
 
     try:
-        files = {
-            "metadata": (None, json.dumps(meta), "application/json"),
-            "full_a": (f"a.{fmt}", enc_a["main_full"], f"image/{fmt}"),
-            "thumb_a": (f"at.{fmt}", enc_a["main_thumb"], f"image/{fmt}"),
-            "full_b": (f"b.{fmt}", enc_b["main_full"], f"image/{fmt}"),
-            "thumb_b": (f"bt.{fmt}", enc_b["main_thumb"], f"image/{fmt}"),
-        }
+        files = {"metadata": (None, json.dumps(meta), "application/json")}
+        for a, p in zip(nps, panels):
+            files[f"raw_{p['id']}"] = (f"{p['id']}.npy", _npy_bytes(a),
+                                       "application/octet-stream")
         httpx.post(f"{base_url()}/event", files=files, timeout=_POST_TIMEOUT)
     except Exception as e:
-        pa = _fallback_write(enc_a["main_full"], (label or "") + "_a", ext=fmt)
-        pb = _fallback_write(enc_b["main_full"], (label or "") + "_b", ext=fmt)
-        print(f"[debug_viz] post failed ({e}); saved {pa}, {pb}")
+        print(f"[debug_viz] post failed: {e}")
 
 
 def save(path: str | Path) -> None:
@@ -158,7 +199,7 @@ def save(path: str | Path) -> None:
         print("[debug_viz] server not running; nothing to save")
         return
     try:
-        httpx.post(f"{base_url()}/snapshot", json={"path": str(p)}, timeout=30.0)
+        httpx.post(f"{base_url()}/snapshot", json={"path": str(p)}, timeout=120.0)
         print(f"[debug_viz] saved snapshot -> {p}")
     except Exception as e:
         print(f"[debug_viz] save failed: {e}")

@@ -8,31 +8,41 @@
 </head>
 <body>
 <header>
+  <button id="gallery_toggle" class="icon-btn" title="Toggle gallery (g)">≡</button>
   <h1>debug_viz</h1>
   <div id="status" class="status disconnected">offline</div>
   <div id="count" class="count">0 frames</div>
+  <div id="font_scale" class="seg seg-sm" title="UI font size">
+    <button data-fs="s">S</button>
+    <button data-fs="m" class="on">M</button>
+    <button data-fs="l">L</button>
+    <button data-fs="xl">XL</button>
+  </div>
 </header>
 
-<main id="gallery"></main>
-
-<div id="modal" class="modal hidden" aria-hidden="true">
-  <div class="modal-stage">
-    <div class="panzoom-host" id="pz_host">
-      <div class="panzoom-target" id="pz_target"></div>
-    </div>
-    <div id="band_strip" class="band-strip hidden"></div>
-  </div>
-  <aside class="modal-side">
-    <button class="close" id="modal_close" title="Close (Esc)">×</button>
-    <div class="m-header">
-      <h2 id="m_label" class="m-label" contenteditable="true"></h2>
-      <span id="m_kind" class="kind-badge"></span>
-    </div>
-    <dl id="m_stats" class="m-stats"></dl>
-    <div class="m-note" id="m_note"></div>
-    <button class="danger" id="m_delete">Delete frame</button>
-    <div class="hint">scroll = zoom · drag = pan · dblclick = reset · 0 = reset · Esc = close</div>
+<div id="split">
+  <aside id="pane_gallery" class="pane pane-gallery">
+    <div id="gallery"></div>
   </aside>
+  <section id="pane_viewer" class="pane pane-viewer">
+    <div id="viewer_empty" class="viewer-empty">
+      <div>
+        <p>No frame selected.</p>
+        <p class="hint">Click a thumbnail to inspect.</p>
+      </div>
+    </div>
+    <div id="viewer_root" class="viewer-root hidden">
+      <div class="viewer-header">
+        <h2 id="v_title" class="v-title" contenteditable="true" spellcheck="false"></h2>
+        <span id="v_kind" class="kind-badge"></span>
+        <div class="spacer"></div>
+        <button id="v_delete" class="danger ghost" title="Delete frame">Delete</button>
+      </div>
+      <div id="v_canvas_row" class="canvas-row"></div>
+      <div id="v_controls" class="controls"></div>
+      <div id="v_meta" class="v-meta"></div>
+    </div>
+  </section>
 </div>
 
 <template id="tile_tmpl">
@@ -47,7 +57,19 @@
   </article>
 </template>
 
-<script src="/static/panzoom.min.js"></script>
+<template id="panel_tmpl">
+  <div class="vp">
+    <div class="vp-header">
+      <input class="vp-title" type="text" spellcheck="false" />
+      <span class="vp-shape"></span>
+    </div>
+    <div class="vp-osd"></div>
+    <div class="vp-stats"></div>
+  </div>
+</template>
+
+<script src="/static/openseadragon.min.js"></script>
+<script src="/static/split.min.js"></script>
 <script src="/static/app.js"></script>
 </body>
 </html>

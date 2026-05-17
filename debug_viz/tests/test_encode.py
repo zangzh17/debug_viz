@@ -1,131 +1,127 @@
-import io
-
+"""Tests for the pure-render core (encode.render_array)."""
 import numpy as np
 from PIL import Image
 
-from debug_viz.encode import encode_array, THUMB_MAX
-
-
-def _open(b: bytes) -> Image.Image:
-    return Image.open(io.BytesIO(b))
+from debug_viz.encode import render_array
 
 
 def test_gray_2d(gray_2d):
-    out = encode_array(gray_2d)
+    out = render_array(gray_2d)
     assert out["kind"] == "gray"
-    assert out["fmt"] == "jpeg"
-    img = _open(out["main_full"])
-    assert img.size == (60, 40)
+    assert isinstance(out["image"], Image.Image)
+    assert out["image"].size == (60, 40)
     assert out["shape"] == [40, 60]
     assert out["dtype"].startswith("float")
     assert "min" in out["stats"]
-    thumb = _open(out["main_thumb"])
-    assert max(thumb.size) <= THUMB_MAX
+    assert out["lossless"] is False
+    assert out["scale"] == "linear"
 
 
 def test_gray_nan_overlay(gray_with_nan):
-    out = encode_array(gray_with_nan)
-    img = np.array(_open(out["main_full"]).convert("RGB"))
+    out = render_array(gray_with_nan)
+    img = np.array(out["image"].convert("RGB"))
     assert tuple(img[0, 0]) == (255, 0, 0)
     assert out["stats"]["nan_pct"] > 0
+    assert out["lossless"] is True  # NaN forces PNG-quality output
 
 
 def test_log_scale(gray_2d):
-    out = encode_array(gray_2d, scale="log")
+    out = render_array(gray_2d, scale="log")
     assert out["scale"] == "log"
-    assert _open(out["main_full"]).size == (60, 40)
+    assert out["image"].size == (60, 40)
+
+
+def test_clip_pct_applied(big_2d):
+    out = render_array(big_2d, clip_pct=(5.0, 95.0))
+    lo, hi = out["clip"]
+    # 5/95 percentile band must be narrower than 0/100
+    assert lo > float(big_2d.min())
+    assert hi < float(big_2d.max())
+    assert out["clip_pct"] == [5.0, 95.0]
 
 
 def test_rgb_3d(rgb_3d):
-    out = encode_array(rgb_3d)
+    out = render_array(rgb_3d)
     assert out["kind"] == "rgb"
-    img = _open(out["main_full"]).convert("RGB")
-    assert img.size == (30, 20)
+    assert out["image"].size == (30, 20)
     assert out["shape"] == [20, 30, 3]
 
 
 def test_mask_auto(mask_2d):
-    out = encode_array(mask_2d)
+    out = render_array(mask_2d)
     assert out["kind"] == "mask"
-    img = np.array(_open(out["main_full"]).convert("RGB"))
+    img = np.array(out["image"].convert("RGB"))
     assert tuple(img[7, 7]) == (255, 220, 0)
     assert tuple(img[0, 0]) == (0, 0, 0)
+    assert out["lossless"] is True
 
 
 def test_multi_auto():
-    rng = np.random.default_rng(0)
-    arr = rng.random((30, 40, 5), dtype=np.float32)
-    out = encode_array(arr)
+    arr = np.random.default_rng(0).random((30, 40, 5), dtype=np.float32)
+    out = render_array(arr)
     assert out["kind"] == "multi"
-    assert "bands" in out and len(out["bands"]) == 5
+    assert out["bands"] is not None and len(out["bands"]) == 5
     for b in out["bands"]:
-        # JPEG magic
-        assert b["full"][:3] == b"\xff\xd8\xff"
-        bimg = _open(b["full"])
-        assert bimg.size == (40, 30)
+        assert isinstance(b["image"], Image.Image)
+        assert b["image"].size == (40, 30)
+        assert b["wavelength"] is None
 
 
 def test_multi_with_bands_selection():
     arr = np.random.default_rng(0).random((20, 25, 7), dtype=np.float32)
-    out = encode_array(arr, bands=(0, 3, 6))
+    out = render_array(arr, bands=(0, 3, 6))
     assert out["kind"] == "multi"
-    assert "ch0" in (out["note"] or "")
-    assert "ch3" in (out["note"] or "")
-    assert "ch6" in (out["note"] or "")
-    assert len(out["bands"]) == 7
+    note = out["note"] or ""
+    assert "ch0" in note and "ch3" in note and "ch6" in note
 
 
-def test_explicit_kind_mono(gray_2d):
-    out = encode_array(gray_2d, kind="mono")
+def test_multi_with_wavelengths():
+    """All-bands wavelength composite → uses wavelength tinting, not R/G/B picks."""
+    arr = np.zeros((40, 50, 3), dtype=np.float32)
+    arr[..., 0] = 1.0  # band 0 = full intensity
+    out = render_array(arr, kind="multi", wavelengths=[450, 550, 650])
+    assert out["bands"][0]["wavelength"] == 450
+    assert "wavelength-weighted" in (out["note"] or "")
+    # band 0 (450nm = blue) lit → composite should be blue-dominant
+    pix = np.array(out["image"])[20, 25]
+    assert pix[2] > pix[0]  # blue > red
+
+
+def test_mono_tinted_by_wavelength(gray_2d):
+    out = render_array(gray_2d, kind="mono", wavelength=656)
     assert out["kind"] == "mono"
-    assert _open(out["main_full"]).size == (60, 40)
+    assert "656" in (out["note"] or "")
+    img = np.array(out["image"])
+    # 656nm = pure red, so green/blue channels should be ~0
+    bright = img.reshape(-1, 3).max(axis=0)
+    assert bright[0] > 100   # red present
+    assert bright[1] < 30    # green suppressed
+    assert bright[2] < 30    # blue suppressed
 
 
 def test_explicit_kind_raw(gray_2d):
-    out = encode_array(gray_2d, kind="raw")
+    out = render_array(gray_2d, kind="raw")
     assert out["kind"] == "raw"
-    assert "demosaic" in (out["note"] or "")
-
-
-def test_explicit_kind_gray_on_3d_fails_gracefully():
-    arr = np.zeros((4, 4, 3), dtype=np.float32)
-    out = encode_array(arr, kind="gray")
-    assert "encode error" in (out["note"] or "") or out["kind"] == "gray"
-
-
-def test_thumb_aspect_preserved():
-    arr = np.zeros((4000, 1000), dtype=np.float32)
-    out = encode_array(arr)
-    thumb = _open(out["main_thumb"])
-    assert max(thumb.size) <= THUMB_MAX
-    assert abs((thumb.size[1] / thumb.size[0]) - 4.0) < 0.1
-
-
-def test_stats_full_resolution(big_2d):
-    out = encode_array(big_2d)
-    assert out["stats"]["min"] == float(big_2d.min())
-    assert out["stats"]["max"] == float(big_2d.max())
+    assert "raw" in (out["note"] or "")
 
 
 def test_constant_array():
     arr = np.ones((20, 20), dtype=np.float32) * 0.5
-    out = encode_array(arr)
-    img = np.array(_open(out["main_full"]).convert("RGB"))
-    # Constant -> norm=1 -> bright. JPEG q=95 ~ exact 255.
-    assert (img > 240).all()
+    out = render_array(arr)
+    img = np.array(out["image"].convert("RGB"))
+    assert (img >= 250).all()
 
 
-def test_png_format_supported():
-    arr = np.zeros((20, 20), dtype=np.float32)
-    out = encode_array(arr, fmt="png")
-    assert out["fmt"] == "png"
-    assert out["main_full"][:8] == b"\x89PNG\r\n\x1a\n"
+def test_stats_includes_finite_only(gray_with_nan):
+    out = render_array(gray_with_nan)
+    assert np.isfinite(out["stats"]["min"])
+    assert np.isfinite(out["stats"]["max"])
 
 
-def test_downsample_path(big_2d):
-    """Thumbnail produced via numpy downsampling, not double PIL encode."""
-    out = encode_array(big_2d)
-    thumb_img = _open(out["main_thumb"])
-    # full is 1200x1500, max_dim 400 -> stride 3 -> ~400x500
-    assert max(thumb_img.size) <= THUMB_MAX
-    assert thumb_img.size[0] > 100 and thumb_img.size[1] > 100
+def test_kind_explicit_gray_raises_on_3d():
+    arr = np.zeros((4, 4, 3), dtype=np.float32)
+    try:
+        render_array(arr, kind="gray")
+    except ValueError:
+        return
+    raise AssertionError("expected ValueError")

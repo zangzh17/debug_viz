@@ -1,19 +1,45 @@
+"""Server: raw-arrays-in, DZI-out, re-render, snapshot round-trip."""
 import io
 import json
+import uuid
 import zipfile
 
+import numpy as np
 import pytest
-from PIL import Image
 from starlette.testclient import TestClient
 
-from debug_viz.server import build_app, MANIFEST_VERSION
+from debug_viz.server import MANIFEST_VERSION, build_app
 
 
-def _img_bytes(size=(8, 8), color=128, fmt="JPEG"):
-    img = Image.new("L", size, color).convert("RGB")
+def _npy(arr: np.ndarray) -> bytes:
     buf = io.BytesIO()
-    img.save(buf, format=fmt, quality=90)
+    np.save(buf, arr, allow_pickle=False)
     return buf.getvalue()
+
+
+def _single(arr, label="x", *, kind="auto", scale="linear",
+            clip_pct=(1.0, 99.0), wavelength=None, wavelengths=None,
+            bands=None):
+    pid = uuid.uuid4().hex[:12]
+    meta = {
+        "id": uuid.uuid4().hex[:12],
+        "label": label,
+        "ts": 1.0,
+        "mode": "single",
+        "panels": [{
+            "id": pid, "label": "",
+            "kind": kind, "scale": scale,
+            "clip_pct": list(clip_pct),
+            "bands": list(bands) if bands else None,
+            "wavelength": wavelength,
+            "wavelengths": list(wavelengths) if wavelengths else None,
+        }],
+    }
+    files = {
+        "metadata": (None, json.dumps(meta), "application/json"),
+        f"raw_{pid}": (f"{pid}.npy", _npy(arr), "application/octet-stream"),
+    }
+    return meta, files, pid
 
 
 @pytest.fixture
@@ -23,179 +49,197 @@ def client(tmp_path):
         yield c
 
 
-def _post_single(client, label="x", kind="gray"):
-    meta = {"label": label, "ts": 1.0, "mode": "single", "kind": kind,
-            "fmt": "jpeg", "shape": [8, 8], "dtype": "uint8",
-            "stats": {"min": 0, "max": 1}, "scale": "linear",
-            "clip": [0, 1], "note": None, "n_bands": 0}
-    files = {
-        "metadata": (None, json.dumps(meta), "application/json"),
-        "main_full": ("f.jpeg", _img_bytes(), "image/jpeg"),
-        "main_thumb": ("t.jpeg", _img_bytes((4, 4)), "image/jpeg"),
-    }
-    r = client.post("/event", files=files)
-    assert r.status_code == 200, r.text
-    return r.json()["id"]
-
-
-def _post_multi(client, label="m", n_bands=3):
-    band_meta = [{"label": f"ch {i}", "stats": {"min": 0}, "clip": [0, 1]}
-                 for i in range(n_bands)]
-    meta = {"label": label, "ts": 1.0, "mode": "single", "kind": "multi",
-            "fmt": "jpeg", "shape": [8, 8, n_bands], "dtype": "float32",
-            "stats": {}, "scale": "linear", "clip": [0, 1], "note": None,
-            "n_bands": n_bands, "band_meta": band_meta}
-    files = {
-        "metadata": (None, json.dumps(meta), "application/json"),
-        "main_full": ("f.jpeg", _img_bytes(), "image/jpeg"),
-        "main_thumb": ("t.jpeg", _img_bytes((4, 4)), "image/jpeg"),
-    }
-    for i in range(n_bands):
-        files[f"band_{i}_full"] = (f"b{i}.jpeg", _img_bytes(color=50 + 20 * i), "image/jpeg")
-        files[f"band_{i}_thumb"] = (f"b{i}t.jpeg", _img_bytes((4, 4), color=50 + 20 * i), "image/jpeg")
-    r = client.post("/event", files=files)
-    assert r.status_code == 200, r.text
-    return r.json()["id"]
-
-
 def test_health(client):
     assert client.get("/health").json()["ok"] is True
 
 
-def test_event_then_frames(client):
-    fid = _post_single(client, "hello")
-    frames = client.get("/frames").json()["frames"]
-    assert len(frames) == 1
-    f = frames[0]
-    assert f["id"] == fid
-    assert f["label"] == "hello"
-    assert f["kind"] == "gray"
-    assert f["main_asset"] == fid
-    assert "thumb_b64" not in f  # No longer inlined
+def test_event_creates_dzi_and_thumb(client, tmp_path):
+    arr = np.random.default_rng(0).random((100, 200), dtype=np.float32)
+    _, files, pid = _single(arr, label="g")
+    r = client.post("/event", files=files)
+    assert r.status_code == 200, r.text
+    fid = r.json()["id"]
+
+    frame = client.get("/frames").json()["frames"][0]
+    assert frame["id"] == fid
+    panel = frame["panels"][0]
+    assert panel["id"] == pid
+    assert panel["kind"] == "gray"
+    assert panel["dzi"]["width"] == 200 and panel["dzi"]["height"] == 100
+    assert panel["render_id"]
+
+    # DZI descriptor + at least one bottom-level tile must be served
+    rid = panel["render_id"]
+    desc = client.get(f"/dzi/{pid}/{rid}.dzi")
+    assert desc.status_code == 200
+    assert b"<Image" in desc.content
+    ext = "jpg" if panel["fmt"] == "jpeg" else panel["fmt"]
+    tile = client.get(f"/dzi/{pid}/{rid}_files/0/0_0.{ext}")
+    assert tile.status_code == 200
+
+    thumb = client.get(f"/thumb/{pid}")
+    assert thumb.status_code == 200
 
 
-def test_image_endpoint(client):
-    fid = _post_single(client)
-    r = client.get(f"/image/{fid}")
+def test_event_with_wavelength_for_mono(client):
+    arr = np.full((20, 20), 0.8, dtype=np.float32)
+    _, files, pid = _single(arr, kind="mono", wavelength=656.3)
+    client.post("/event", files=files)
+    panel = client.get("/frames").json()["frames"][0]["panels"][0]
+    assert panel["wavelength"] == 656.3
+    assert "656" in (panel.get("note") or "")
+
+
+def test_event_multi_with_wavelengths_generates_band_thumbs(client):
+    arr = np.random.default_rng(0).random((30, 30, 4), dtype=np.float32)
+    _, files, pid = _single(arr, kind="multi", wavelengths=[450, 550, 650, 750])
+    client.post("/event", files=files)
+    panel = client.get("/frames").json()["frames"][0]["panels"][0]
+    assert panel["kind"] == "multi"
+    assert panel["n_bands"] == 4
+    # Per-band thumbs must be servable
+    for bm in panel["bands_meta"]:
+        r = client.get(f"/thumb/{bm['asset']}")
+        assert r.status_code == 200
+
+
+def test_compare_three_panels(client):
+    a = np.full((16, 16), 0.3, dtype=np.float32)
+    b = np.full((16, 16), 0.6, dtype=np.float32)
+    c = np.full((16, 16), 0.9, dtype=np.float32)
+    panels = []
+    files = {}
+    for arr, sub in zip([a, b, c], ["noisy", "denoised", "gt"]):
+        pid = uuid.uuid4().hex[:12]
+        panels.append({"id": pid, "label": sub, "kind": "auto",
+                       "scale": "linear", "clip_pct": [1.0, 99.0],
+                       "bands": None, "wavelength": None, "wavelengths": None})
+        files[f"raw_{pid}"] = (f"{pid}.npy", _npy(arr), "application/octet-stream")
+    meta = {"id": uuid.uuid4().hex[:12], "label": "3way", "ts": 1.0,
+            "mode": "compare", "panels": panels}
+    files["metadata"] = (None, json.dumps(meta), "application/json")
+    r = client.post("/event", files=files)
     assert r.status_code == 200
-    assert r.headers["content-type"] == "image/jpeg"
-    assert r.content[:3] == b"\xff\xd8\xff"  # JPEG magic
+    f = client.get("/frames").json()["frames"][0]
+    assert f["mode"] == "compare"
+    assert [p["label"] for p in f["panels"]] == ["noisy", "denoised", "gt"]
+    # Each panel has its own DZI
+    for p in f["panels"]:
+        assert p["dzi"]["width"] == 16
 
 
-def test_thumb_endpoint(client):
-    fid = _post_single(client)
-    r = client.get(f"/thumb/{fid}")
+def test_rerender_changes_render_id_and_dzi(client):
+    arr = np.random.default_rng(0).random((50, 50), dtype=np.float32)
+    _, files, pid = _single(arr)
+    client.post("/event", files=files)
+    rid_before = client.get("/frames").json()["frames"][0]["panels"][0]["render_id"]
+
+    r = client.post(f"/rerender/{pid}", json={"scale": "log", "clip_pct": [5.0, 95.0]})
     assert r.status_code == 200
-    assert r.headers["content-type"] == "image/jpeg"
+    panel = r.json()["panel"]
+    assert panel["render_id"] != rid_before
+    assert panel["scale"] == "log"
+    assert panel["clip_pct"] == [5.0, 95.0]
+
+    # New DZI accessible
+    new_desc = client.get(f"/dzi/{pid}/{panel['render_id']}.dzi")
+    assert new_desc.status_code == 200
+    # Old DZI intentionally kept (OSD navigator may still be loading from it).
+    # It's removed only when the frame itself is deleted.
+    old_desc = client.get(f"/dzi/{pid}/{rid_before}.dzi")
+    assert old_desc.status_code == 200
 
 
-def test_patch_label(client):
-    fid = _post_single(client, "orig")
+def test_rerender_to_single_band_mono_view(client):
+    """Click a band in the strip → re-render as kind=mono, bands=[i]."""
+    arr = np.random.default_rng(0).random((20, 20, 4), dtype=np.float32)
+    arr[..., 1] = 0.9  # band 1 bright
+    _, files, pid = _single(arr, kind="multi", wavelengths=[450, 550, 650, 750])
+    client.post("/event", files=files)
+
+    r = client.post(f"/rerender/{pid}", json={
+        "kind": "mono", "bands": [1], "wavelength": 550, "wavelengths": None,
+    })
+    assert r.status_code == 200
+    p = r.json()["panel"]
+    assert p["kind"] == "mono"
+    assert p["wavelength"] == 550
+
+
+def test_patch_frame_label(client):
+    arr = np.zeros((4, 4), dtype=np.float32)
+    _, files, _ = _single(arr, label="orig")
+    client.post("/event", files=files)
+    fid = client.get("/frames").json()["frames"][0]["id"]
     r = client.patch(f"/frames/{fid}", json={"label": "renamed"})
     assert r.status_code == 200
     assert client.get("/frames").json()["frames"][0]["label"] == "renamed"
 
 
-def test_delete_frame(client, tmp_path):
-    fid = _post_single(client)
-    full = tmp_path / "assets" / "full" / f"{fid}.jpeg"
-    thumb = tmp_path / "assets" / "thumb" / f"{fid}.jpeg"
-    assert full.exists() and thumb.exists()
+def test_patch_panel_label(client):
+    arr = np.zeros((4, 4), dtype=np.float32)
+    _, files, pid = _single(arr)
+    client.post("/event", files=files)
+    r = client.patch(f"/panels/{pid}", json={"label": "before"})
+    assert r.status_code == 200
+    assert client.get("/frames").json()["frames"][0]["panels"][0]["label"] == "before"
+
+
+def test_delete_frame_removes_dzi_and_raw(client, tmp_path):
+    arr = np.zeros((4, 4), dtype=np.float32)
+    _, files, pid = _single(arr)
+    client.post("/event", files=files)
+    fid = client.get("/frames").json()["frames"][0]["id"]
+    raw = tmp_path / "assets" / "raw" / f"{pid}.npy"
+    dzi_dir = tmp_path / "assets" / "dzi" / pid
+    assert raw.exists() and dzi_dir.exists()
     client.delete(f"/frames/{fid}")
-    assert not full.exists()
-    assert not thumb.exists()
-    assert client.get("/frames").json()["frames"] == []
+    assert not raw.exists()
+    assert not dzi_dir.exists()
 
 
-def test_ws_broadcast(client):
+def test_ws_broadcast_added_and_rerendered(client):
+    arr = np.zeros((4, 4), dtype=np.float32)
+    _, files, pid = _single(arr)
     with client.websocket_connect("/ws") as ws:
-        fid = _post_single(client, "ws_test")
+        client.post("/event", files=files)
         msg = json.loads(ws.receive_text())
         assert msg["kind"] == "frame_added"
-        assert msg["payload"]["label"] == "ws_test"
-        client.patch(f"/frames/{fid}", json={"label": "new"})
-        assert json.loads(ws.receive_text())["kind"] == "frame_updated"
-        client.delete(f"/frames/{fid}")
-        assert json.loads(ws.receive_text())["kind"] == "frame_deleted"
-
-
-def test_compare_event(client):
-    meta = {"label": "cmp", "ts": 1.0, "mode": "compare", "kind": "gray",
-            "fmt": "jpeg", "shape": [[4, 4], [4, 4]], "dtype": ["uint8", "uint8"],
-            "stats": [{"min": 0}, {"min": 1}], "scale": "linear",
-            "clip": [[0, 1], [0, 1]], "note": None}
-    files = {
-        "metadata": (None, json.dumps(meta), "application/json"),
-        "full_a": ("a.jpeg", _img_bytes(), "image/jpeg"),
-        "thumb_a": ("at.jpeg", _img_bytes((4, 4)), "image/jpeg"),
-        "full_b": ("b.jpeg", _img_bytes(color=200), "image/jpeg"),
-        "thumb_b": ("bt.jpeg", _img_bytes((4, 4), color=200), "image/jpeg"),
-    }
-    r = client.post("/event", files=files)
-    assert r.status_code == 200
-    frame = client.get("/frames").json()["frames"][0]
-    assert frame["mode"] == "compare"
-    assert len(frame["compare_assets"]) == 2
-    for aid in frame["compare_assets"]:
-        assert client.get(f"/image/{aid}").status_code == 200
-        assert client.get(f"/thumb/{aid}").status_code == 200
-
-
-def test_multi_event(client, tmp_path):
-    fid = _post_multi(client, n_bands=4)
-    f = client.get("/frames").json()["frames"][0]
-    assert f["kind"] == "multi"
-    assert len(f["bands"]) == 4
-    for i, b in enumerate(f["bands"]):
-        assert b["asset"] == f"{fid}__b{i}"
-        assert b["label"] == f"ch {i}"
-        # Each band asset must be servable
-        assert client.get(f"/image/{b['asset']}").status_code == 200
-        assert client.get(f"/thumb/{b['asset']}").status_code == 200
-
-
-def test_multi_delete_cleans_bands(client, tmp_path):
-    fid = _post_multi(client, n_bands=3)
-    full_dir = tmp_path / "assets" / "full"
-    assert (full_dir / f"{fid}.jpeg").exists()
-    for i in range(3):
-        assert (full_dir / f"{fid}__b{i}.jpeg").exists()
-    client.delete(f"/frames/{fid}")
-    assert not (full_dir / f"{fid}.jpeg").exists()
-    for i in range(3):
-        assert not (full_dir / f"{fid}__b{i}.jpeg").exists()
+        client.post(f"/rerender/{pid}", json={"scale": "log"})
+        msg = json.loads(ws.receive_text())
+        assert msg["kind"] == "panel_rerendered"
+        assert msg["payload"]["id"] == pid
 
 
 def test_snapshot_roundtrip(client, tmp_path):
-    fid = _post_single(client, "snap")
+    arr = np.random.default_rng(0).random((16, 16), dtype=np.float32)
+    _, files, pid = _single(arr, label="snap")
+    client.post("/event", files=files)
+    fid = client.get("/frames").json()["frames"][0]["id"]
+    rid = client.get("/frames").json()["frames"][0]["panels"][0]["render_id"]
+
     out = tmp_path / "out.dbv"
     client.post("/snapshot", json={"path": str(out)})
     assert out.exists()
     with zipfile.ZipFile(out) as z:
-        names = z.namelist()
+        names = set(z.namelist())
         assert "manifest.json" in names
-        assert f"full/{fid}.jpeg" in names
-        assert f"thumb/{fid}.jpeg" in names
+        assert f"raw/{pid}.npy" in names
+        assert any(n.startswith(f"thumb/{pid}.") for n in names)
+        assert any(n.startswith(f"dzi/{pid}/{rid}_files/") for n in names)
         manifest = json.loads(z.read("manifest.json"))
         assert manifest["version"] == MANIFEST_VERSION
         assert manifest["frames"][0]["id"] == fid
 
 
-def test_snapshot_includes_bands(client, tmp_path):
-    fid = _post_multi(client, n_bands=4)
-    out = tmp_path / "m.dbv"
-    client.post("/snapshot", json={"path": str(out)})
-    with zipfile.ZipFile(out) as z:
-        names = z.namelist()
-        for i in range(4):
-            assert f"full/{fid}__b{i}.jpeg" in names
-            assert f"thumb/{fid}__b{i}.jpeg" in names
-
-
-def test_load_manifest(tmp_path):
+def test_replay_from_snapshot(tmp_path):
+    """Save → extract → load_manifest → DZI / thumb endpoints still work."""
+    arr = np.random.default_rng(0).random((20, 20), dtype=np.float32)
     app1 = build_app(tmp_path / "a1")
     with TestClient(app1) as c1:
-        fid = _post_multi(c1, "preserved", n_bands=2)
+        _, files, pid = _single(arr, label="x")
+        c1.post("/event", files=files)
+        rid = c1.get("/frames").json()["frames"][0]["panels"][0]["render_id"]
         out = tmp_path / "x.dbv"
         c1.post("/snapshot", json={"path": str(out)})
 
@@ -204,14 +248,34 @@ def test_load_manifest(tmp_path):
     with zipfile.ZipFile(out) as z:
         z.extractall(extract)
     manifest = json.loads((extract / "manifest.json").read_text())
+
     app2 = build_app(extract, load_manifest=manifest)
     with TestClient(app2) as c2:
         frames = c2.get("/frames").json()["frames"]
-        assert len(frames) == 1
-        assert frames[0]["id"] == fid
-        assert frames[0]["kind"] == "multi"
-        assert len(frames[0]["bands"]) == 2
-        # All band image and thumb endpoints work in replay
-        for b in frames[0]["bands"]:
-            assert c2.get(f"/image/{b['asset']}").status_code == 200
-            assert c2.get(f"/thumb/{b['asset']}").status_code == 200
+        assert len(frames) == 1 and frames[0]["panels"][0]["id"] == pid
+        # DZI tiles and raw both survive
+        assert c2.get(f"/dzi/{pid}/{rid}.dzi").status_code == 200
+        assert c2.get(f"/thumb/{pid}").status_code == 200
+
+
+def test_replay_supports_rerender(tmp_path):
+    """After loading from snapshot, re-render must still work (raw was saved)."""
+    arr = np.random.default_rng(0).random((20, 20), dtype=np.float32)
+    app1 = build_app(tmp_path / "a1")
+    with TestClient(app1) as c1:
+        _, files, pid = _single(arr)
+        c1.post("/event", files=files)
+        out = tmp_path / "x.dbv"
+        c1.post("/snapshot", json={"path": str(out)})
+
+    extract = tmp_path / "extract"
+    extract.mkdir()
+    with zipfile.ZipFile(out) as z:
+        z.extractall(extract)
+    manifest = json.loads((extract / "manifest.json").read_text())
+
+    app2 = build_app(extract, load_manifest=manifest)
+    with TestClient(app2) as c2:
+        r = c2.post(f"/rerender/{pid}", json={"scale": "log"})
+        assert r.status_code == 200, r.text
+        assert r.json()["panel"]["scale"] == "log"
