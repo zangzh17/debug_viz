@@ -20,10 +20,14 @@
     <div class="panzoom-host" id="pz_host">
       <div class="panzoom-target" id="pz_target"></div>
     </div>
+    <div id="band_strip" class="band-strip hidden"></div>
   </div>
   <aside class="modal-side">
     <button class="close" id="modal_close" title="Close (Esc)">×</button>
-    <h2 id="m_label" class="m-label" contenteditable="true"></h2>
+    <div class="m-header">
+      <h2 id="m_label" class="m-label" contenteditable="true"></h2>
+      <span id="m_kind" class="kind-badge"></span>
+    </div>
     <dl id="m_stats" class="m-stats"></dl>
     <div class="m-note" id="m_note"></div>
     <button class="danger" id="m_delete">Delete frame</button>
@@ -34,6 +38,7 @@
 <template id="tile_tmpl">
   <article class="tile">
     <button class="del" title="Delete">×</button>
+    <span class="kind-badge tile-kind"></span>
     <div class="thumb-wrap"></div>
     <div class="meta">
       <div class="label" contenteditable="true" spellcheck="false"></div>
