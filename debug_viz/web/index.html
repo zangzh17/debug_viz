@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>debug_viz</title>
+<link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+<header>
+  <h1>debug_viz</h1>
+  <div id="status" class="status disconnected">offline</div>
+  <div id="count" class="count">0 frames</div>
+</header>
+
+<main id="gallery"></main>
+
+<div id="modal" class="modal hidden" aria-hidden="true">
+  <div class="modal-stage">
+    <div class="panzoom-host" id="pz_host">
+      <div class="panzoom-target" id="pz_target"></div>
+    </div>
+  </div>
+  <aside class="modal-side">
+    <button class="close" id="modal_close" title="Close (Esc)">×</button>
+    <h2 id="m_label" class="m-label" contenteditable="true"></h2>
+    <dl id="m_stats" class="m-stats"></dl>
+    <div class="m-note" id="m_note"></div>
+    <button class="danger" id="m_delete">Delete frame</button>
+    <div class="hint">scroll = zoom · drag = pan · dblclick = reset · 0 = reset · Esc = close</div>
+  </aside>
+</div>
+
+<template id="tile_tmpl">
+  <article class="tile">
+    <button class="del" title="Delete">×</button>
+    <div class="thumb-wrap"></div>
+    <div class="meta">
+      <div class="label" contenteditable="true" spellcheck="false"></div>
+      <div class="stats"></div>
+    </div>
+  </article>
+</template>
+
+<script src="/static/panzoom.min.js"></script>
+<script src="/static/app.js"></script>
+</body>
+</html>
